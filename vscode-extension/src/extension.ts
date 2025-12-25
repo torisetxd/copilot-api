@@ -1,6 +1,6 @@
 import type { Server } from "srvx"
 
-import consola, { type ConsolaReporter } from "consola"
+import consola, { type ConsolaReporter, type LogObject } from "consola"
 import * as net from "node:net"
 import * as vscode from "vscode"
 
@@ -27,7 +27,9 @@ let status: ServerStatus = "stopped"
 let localServer: Server | undefined
 let endpoint: string | undefined
 let consolaReporter: ConsolaReporter | undefined
+let consolaTokenRefreshSignalReporter: ConsolaReporter | undefined
 let lifecycleVersion = 0
+let tokenRefreshFailureHandled = false
 
 function getServerStatus(): ServerStatus {
   return status
@@ -120,9 +122,18 @@ function cleanupLocalServer() {
 }
 
 function cleanupConsolaReporter() {
-  if (!consolaReporter) return
-  consola.removeReporter(consolaReporter)
-  consolaReporter = undefined
+  if (consolaReporter) {
+    consola.removeReporter(consolaReporter)
+    consolaReporter = undefined
+  }
+  if (consolaTokenRefreshSignalReporter) {
+    consola.removeReporter(consolaTokenRefreshSignalReporter)
+    consolaTokenRefreshSignalReporter = undefined
+  }
+}
+
+function resetTokenRefreshFailureGuard() {
+  tokenRefreshFailureHandled = false
 }
 
 function serializeError(error: unknown): { message: string; stack?: string } {
@@ -132,8 +143,48 @@ function serializeError(error: unknown): { message: string; stack?: string } {
   return { message: String(error) }
 }
 
+function isCopilotTokenRefreshFailed(logObj: LogObject): boolean {
+  if (logObj.type !== "error") return false
+  const args = Array.isArray(logObj.args) ? (logObj.args as Array<unknown>) : []
+  const messageText = typeof args[0] === "string" ? args[0] : undefined
+  if (typeof messageText !== "string") return false
+  return messageText.startsWith("Failed to refresh Copilot token")
+}
+
+function createTokenRefreshSignalReporter(
+  currentLifecycleVersion: number,
+): ConsolaReporter {
+  return {
+    log: (logObj) => {
+      if (!isCopilotTokenRefreshFailed(logObj)) return
+      if (tokenRefreshFailureHandled) return
+      queueMicrotask(() => {
+        void maybeStopOnCopilotTokenRefreshFailure(currentLifecycleVersion)
+      })
+    },
+  }
+}
+
+async function maybeStopOnCopilotTokenRefreshFailure(
+  currentLifecycleVersion: number,
+): Promise<void> {
+  if (currentLifecycleVersion !== lifecycleVersion) return
+
+  const currentStatus = getServerStatus()
+  if (currentStatus !== "starting" && currentStatus !== "running") return
+
+  if (tokenRefreshFailureHandled) return
+  tokenRefreshFailureHandled = true
+
+  await stopServer()
+  void vscode.window.showErrorMessage(
+    `Copilot API stopped: Copilot token refresh failed`,
+  )
+}
+
 async function stopServer(): Promise<void> {
   const output = getOutputChannel()
+  resetTokenRefreshFailureGuard()
   lifecycleVersion += 1
 
   const currentLocalServer = localServer
@@ -191,11 +242,16 @@ async function startServer(): Promise<void> {
 
   setServerStarting()
   const currentLifecycleVersion = (lifecycleVersion += 1)
+  resetTokenRefreshFailureGuard()
 
   void showStartingHintAfterDelay()
   try {
     consolaReporter = createVscodeOutputReporter(output)
     consola.addReporter(consolaReporter)
+    consolaTokenRefreshSignalReporter = createTokenRefreshSignalReporter(
+      currentLifecycleVersion,
+    )
+    consola.addReporter(consolaTokenRefreshSignalReporter)
 
     process.env.HOST = "127.0.0.1"
     process.env.NODE_ENV ??= "production"
@@ -228,6 +284,7 @@ async function startServer(): Promise<void> {
     const { message, stack } = serializeError(error)
     output.appendLine(`[server] Error: ${message}`)
     if (stack) output.appendLine(stack)
+    resetTokenRefreshFailureGuard()
     cleanupConsolaReporter()
     cleanupLocalServer()
     setServerStopped()
